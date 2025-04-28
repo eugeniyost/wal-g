@@ -31,6 +31,7 @@ const (
 	MONGO     = "MONGO"
 	GP        = "GP"
 	ETCD      = "ETCD"
+	CASSANDRA = "CASSANDRA"
 
 	DownloadConcurrencySetting    = "WALG_DOWNLOAD_CONCURRENCY"
 	UploadConcurrencySetting      = "WALG_UPLOAD_CONCURRENCY"

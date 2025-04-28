@@ -6,6 +6,7 @@ MAIN_MONGO_PATH := main/mongo
 MAIN_FDB_PATH := main/fdb
 MAIN_GP_PATH := main/gp
 MAIN_ETCD_PATH := main/etcd
+MAIN_CASSANDRA_PATH := main/cassandra
 DOCKER_COMMON := golang ubuntu ubuntu_20_04 s3
 CMD_FILES = $(wildcard cmd/**/*.go)
 PKG_FILES = $(wildcard internal/*.go internal/**/*.go internal/**/**/*.go internal/**/**/**/*.go)
@@ -189,6 +190,12 @@ fdb_integration_test: load_docker_common
 	docker compose down -v
 	docker compose build fdb_tests
 	docker compose up --force-recreate --renew-anon-volumes --exit-code-from fdb_tests fdb_tests
+
+cassandra_build: $(CMD_FILES) $(PKG_FILES)
+	(cd $(MAIN_CASSANDRA_PATH) && go build -mod vendor -tags "$(BUILD_TAGS)" -o wal-g -ldflags "-s -w")
+
+cassandra_install: cassandra_build
+	mv $(MAIN_CASSANDRA_PATH)/wal-g $(GOBIN)/wal-g
 
 redis_test: deps redis_build unlink_brotli redis_integration_test
 
