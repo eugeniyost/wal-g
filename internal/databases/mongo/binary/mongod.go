@@ -22,7 +22,9 @@ import (
 )
 
 const adminDB = "admin"
+const localDB = "local"
 const LatestBackupString = "LATEST_BACKUP"
+const LatestOnReplica = "LATEST_ON_REPLICA"
 
 const cursorCreateRetries = 10
 const mongoConnectRetries = 3
@@ -47,6 +49,50 @@ func CreateMongodService(ctx context.Context, appName, mongodbURI string, timeou
 					SetServerSelectionTimeout(timeout).
 					SetConnectTimeout(timeout).
 					SetSocketTimeout(time.Minute).
+					SetAppName(appName).
+					SetDirect(true).
+					SetRetryReads(false))
+			if err != nil {
+				return errors.Wrap(err, "unable to connect to mongod")
+			}
+			err = mongoClient.Ping(ctx, nil)
+			if err != nil {
+				return errors.Wrap(err, "ping to mongod is failed")
+			}
+			return nil
+		},
+		repeatOptions,
+		func(err error, duration time.Duration) {
+			tracelog.InfoLogger.Printf("Unable to connect due '%+v', next retry: %v", err, duration)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &MongodService{
+		Context:     ctx,
+		MongoClient: mongoClient,
+	}, nil
+}
+
+func CreateBackgroundMongodService(ctx context.Context, appName, mongodbURI string) (*MongodService, error) {
+	var repeatOptions backoff.BackOff
+	repeatOptions = backoff.NewExponentialBackOff()
+	repeatOptions = backoff.WithMaxRetries(repeatOptions, mongoConnectRetries)
+	repeatOptions = backoff.WithContext(repeatOptions, ctx)
+
+	var mongoClient *mongo.Client
+	var err error
+	err = backoff.RetryNotify(
+		func() error {
+			mongoClient, err = mongo.Connect(ctx,
+				options.Client().ApplyURI(mongodbURI).
+					SetMaxPoolSize(1).
+					SetMinPoolSize(1).
+					SetServerSelectionTimeout(time.Minute*10).
+					SetConnectTimeout(time.Minute*10).
+					SetSocketTimeout(time.Minute*10).
 					SetAppName(appName).
 					SetDirect(true).
 					SetRetryReads(false))
@@ -133,7 +179,7 @@ func (mongodService *MongodService) GetBackupCursor() (cursor *mongo.Cursor, err
 		}
 		if i < cursorCreateRetries {
 			minutes := time.Duration(i + 1)
-			tracelog.WarningLogger.Printf("%v. Sleep %d minutes and retry", err.Error(), minutes)
+			tracelog.WarningLogger.Printf("%+v. Sleep %d minutes and retry", err, minutes)
 			time.Sleep(time.Minute * minutes)
 		}
 	}
@@ -159,7 +205,7 @@ func (mongodService *MongodService) GetBackupCursorExtended(backupCursorMeta *Ba
 
 func (mongodService *MongodService) FixReplset(rsConfig RsConfig) error {
 	ctx := mongodService.Context
-	localDatabase := mongodService.MongoClient.Database("local")
+	localDatabase := mongodService.MongoClient.Database(localDB)
 
 	if err := replaceData(ctx, localDatabase.Collection("replset.election"), true, nil); err != nil {
 		return errors.Wrap(err, "unable to fix data in local.replset.election")
@@ -316,6 +362,56 @@ func updateRsConfig(ctx context.Context, localDatabase *mongo.Database, rsConfig
 	return nil
 }
 
+func convertToFile(ident string) string {
+	return fmt.Sprintf("/%s.wt", ident)
+}
+
+type CatalogRecord struct {
+	Type       string            `bson:"type"`
+	Database   string            `bson:"db"`
+	Collection string            `bson:"name"`
+	Ident      string            `bson:"ident"`
+	IndexIdent map[string]string `bson:"idxIdent"`
+}
+
+func CreateBackupRoutesInfo(mongodService *MongodService) (*models.BackupRoutesInfo, error) {
+	routes := models.NewBackupRoutesInfo()
+
+	pipeline := mongo.Pipeline{{{Key: "$listCatalog", Value: bson.M{}}}}
+	cursor, err := mongodService.MongoClient.Database(adminDB).Aggregate(mongodService.Context, pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	for cursor.TryNext(mongodService.Context) {
+		var record CatalogRecord
+		if err = cursor.Decode(&record); err != nil {
+			return nil, err
+		}
+		if record.Type != "collection" {
+			continue
+		}
+
+		indexInfo := make(models.IndexInfo)
+		for index, uri := range record.IndexIdent {
+			indexInfo[index] = models.Paths{DBPath: convertToFile(uri)}
+		}
+
+		colInfo := models.CollectionInfo{
+			Paths:     models.Paths{DBPath: convertToFile(record.Ident)},
+			IndexInfo: indexInfo,
+		}
+
+		if _, ok := routes.Databases[record.Database]; !ok {
+			routes.Databases[record.Database] = make(models.DBInfo)
+		}
+
+		routes.Databases[record.Database][record.Collection] = colInfo
+	}
+
+	return &routes, nil
+}
+
 func replaceData(ctx context.Context, collection *mongo.Collection, drop bool, insertData bson.M) error {
 	findCursor, err := collection.Find(ctx, bson.D{})
 	if err != nil {
@@ -401,6 +497,9 @@ type RestoreArgs struct {
 	SkipBackupDownload bool
 	SkipChecks         bool
 	SkipMongoReconfig  bool
+
+	Whitelist []string
+	Blacklist []string
 }
 
 type RsConfig struct {
@@ -418,7 +517,13 @@ type ReplyOplogConfig struct {
 	OplogAlwaysUpsert    *bool
 	OplogApplicationMode *string
 
-	HasPitr bool
+	HasPitr             bool
+	Partial             bool
+	WithCatchUpReconfig bool
+	MinimalConfigPath   string
+
+	Whitelist map[string]map[string]struct{}
+	Blacklist map[string]map[string]struct{}
 }
 
 type ShConfig struct {
@@ -451,7 +556,9 @@ func NewShConfig(shardName string, connectionString string) ShConfig {
 	}
 }
 
-func NewReplyOplogConfig(sincePitrStr string, untilPitrStr string) (ReplyOplogConfig, error) {
+func NewReplyOplogConfig(
+	sincePitrStr, untilPitrStr string, partial, withCatchUpReconfig bool, minimalConfigPath string,
+) (ReplyOplogConfig, error) {
 	var roConfig ReplyOplogConfig
 	var err error
 	roConfig.HasPitr = true
@@ -487,6 +594,11 @@ func NewReplyOplogConfig(sincePitrStr string, untilPitrStr string) (ReplyOplogCo
 		conf.OplogReplayOplogApplicationMode); hasOplogApplicationMode {
 		roConfig.OplogApplicationMode = &oplogApplicationMode
 	}
+
+	roConfig.Partial = partial
+	roConfig.WithCatchUpReconfig = withCatchUpReconfig
+	roConfig.MinimalConfigPath = minimalConfigPath
+
 	return roConfig, err
 }
 
@@ -504,6 +616,8 @@ func processTimestamp(arg string, downloader *archive.StorageDownloader) (models
 			return models.Timestamp{}, err
 		}
 		return models.TimestampFromBson(backupMeta.MongoMeta.BackupLastTS), nil
+	case LatestOnReplica:
+		return models.Timestamp{}, nil
 	default:
 		return models.TimestampFromStr(arg)
 	}
@@ -553,4 +667,8 @@ func (shConfig ShConfig) Validate() error {
 		return fmt.Errorf("got shard name %s, but mongocfg connection string is %s", shConfig.ShardName, shConfig.MongoCfgConnectionString)
 	}
 	return nil
+}
+
+func (args RestoreArgs) IsPartial() bool {
+	return len(args.Whitelist)+len(args.Blacklist) > 0
 }
